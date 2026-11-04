@@ -1,4 +1,5 @@
 export 'auth/auth.dart';
+export 'cohorts/cohorts.dart';
 export 'credits/credits.dart';
 export 'home/home.dart';
 export 'workspaces/workspaces.dart';

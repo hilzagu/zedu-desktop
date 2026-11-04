@@ -26,7 +26,8 @@ class AppRouter {
   static final authStatus = ValueNotifier<AuthStatus>(AuthStatus.unknown);
 
   /// Routes that stay reachable while signed out. Change password is part of
-  /// the signed-out reset flow ("Use current password").
+  /// the signed-out reset flow ("Use current password"). The public cohort
+  /// pages are matched by prefix in [isPublicPath].
   static const publicPaths = {
     login,
     magicLinkRequest,
@@ -37,12 +38,22 @@ class AppRouter {
     changePassword,
   };
 
+  /// Where the sign-in-free cohort pages live.
+  static const cohortPrefix = '/cohorts';
+
+  /// Whether [path] stays reachable while signed out: one of [publicPaths],
+  /// or a published cohort page.
+  static bool isPublicPath(String path) =>
+      publicPaths.contains(path) ||
+      path == cohortPrefix ||
+      path.startsWith('$cohortPrefix/');
+
   /// Sends a signed-out user on a signed-in route to the login page, for
   /// example after a 401 ends the session. Nothing redirects while the status
   /// is still [AuthStatus.unknown] (the saved session is being restored).
   static String? redirectSignedOut(GoRouterState state) {
     if (authStatus.value != AuthStatus.unauthenticated) return null;
-    return publicPaths.contains(state.uri.path) ? null : login;
+    return isPublicPath(state.uri.path) ? null : login;
   }
 
   static final router = GoRouter(
@@ -69,6 +80,11 @@ class AppRouter {
       ),
 
       GoRoute(path: home, builder: (context, state) => const HomeView()),
+      GoRoute(
+        path: '/cohorts/:slug',
+        builder: (context, state) =>
+            PublicCohortView(slug: state.pathParameters['slug'] ?? ''),
+      ),
       GoRoute(path: signup, builder: (context, state) => const SignUpView()),
       GoRoute(
         path: forgotPassword,

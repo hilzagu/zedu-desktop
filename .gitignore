@@ -14,6 +14,8 @@ migrate_working_dir/
 *.txt
 # Desktop platform build files; without this Linux/Windows projects are incomplete.
 !CMakeLists.txt
+# The public sitemap needs a robots.txt next to it.
+!web/robots.txt
 
 # IntelliJ related
 *.iml

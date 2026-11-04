@@ -1,0 +1,7 @@
+# Search engines may index Zedu's public pages, including the public cohort
+# pages under /cohorts/. Signed-in app screens are behind the login flow and
+# carry no indexable content.
+User-agent: *
+Allow: /
+
+Sitemap: https://zedu.chat/sitemap.xml
