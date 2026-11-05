@@ -87,8 +87,49 @@ ThemeData _themeWithReadableButton() {
 /// The file only uses router APIs that exist on the destination branch, so it
 /// also runs there to produce the "before" picture: without the public route
 /// the URL redirects to the login wall.
+// Golden files are compared on CI's Linux runner while the committed images
+// were captured on Windows, where fonts rasterise slightly differently. The
+// repo's invite CTA test allows a small pixel difference for this reason;
+// this does the same, at the same 5% tolerance.
+class _TolerantGoldenComparator extends LocalFileComparator {
+  _TolerantGoldenComparator(super.testFile, {this.tolerance = 0.05});
+
+  final double tolerance;
+
+  @override
+  Future<bool> compare(Uint8List imageBytes, Uri golden) async {
+    final ComparisonResult result = await GoldenFileComparator.compareLists(
+      imageBytes,
+      await getGoldenBytes(golden),
+    );
+
+    final passed = result.passed || result.diffPercent <= tolerance;
+    if (passed) {
+      result.dispose();
+      return true;
+    }
+
+    final String error = await generateFailureOutput(result, golden, basedir);
+    result.dispose();
+    throw FlutterError(error);
+  }
+}
+
+void _useTolerantGoldenComparator(String testFileName) {
+  final currentComparator = goldenFileComparator;
+  if (currentComparator is LocalFileComparator) {
+    goldenFileComparator = _TolerantGoldenComparator(
+      currentComparator.basedir.resolve(testFileName),
+      tolerance: 0.05,
+    );
+  }
+}
+
 void main() {
-  setUpAll(_loadAppFonts);
+  setUpAll(() async {
+    await _loadAppFonts();
+    _useTolerantGoldenComparator('cohort_route_screenshot_test.dart');
+  });
 
   tearDown(() {
     AppRouter.authStatus.value = AuthStatus.unknown;

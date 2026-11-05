@@ -119,8 +119,49 @@ Widget _pumpAt(String location) {
   );
 }
 
+// Golden files are compared on CI's Linux runner while the committed images
+// were captured on Windows, where fonts rasterise slightly differently. The
+// repo's invite CTA test allows a small pixel difference for this reason;
+// this does the same, at the same 5% tolerance.
+class _TolerantGoldenComparator extends LocalFileComparator {
+  _TolerantGoldenComparator(super.testFile, {this.tolerance = 0.05});
+
+  final double tolerance;
+
+  @override
+  Future<bool> compare(Uint8List imageBytes, Uri golden) async {
+    final ComparisonResult result = await GoldenFileComparator.compareLists(
+      imageBytes,
+      await getGoldenBytes(golden),
+    );
+
+    final passed = result.passed || result.diffPercent <= tolerance;
+    if (passed) {
+      result.dispose();
+      return true;
+    }
+
+    final String error = await generateFailureOutput(result, golden, basedir);
+    result.dispose();
+    throw FlutterError(error);
+  }
+}
+
+void _useTolerantGoldenComparator(String testFileName) {
+  final currentComparator = goldenFileComparator;
+  if (currentComparator is LocalFileComparator) {
+    goldenFileComparator = _TolerantGoldenComparator(
+      currentComparator.basedir.resolve(testFileName),
+      tolerance: 0.05,
+    );
+  }
+}
+
 void main() {
-  setUpAll(loadAppFonts);
+  setUpAll(() async {
+    await loadAppFonts();
+    _useTolerantGoldenComparator('public_cohort_view_test.dart');
+  });
 
   testWidgets('renders the approved cohort for its slug', (tester) async {
     tester.view.physicalSize = const Size(1280, 900);
