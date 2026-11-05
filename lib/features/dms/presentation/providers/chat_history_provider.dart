@@ -27,6 +27,10 @@ class ChatHistoryNotifier extends ChangeNotifier {
   String? editingMessageId;
   final Map<String, Future<void>> _saveEditChains = {};
 
+  /// Messages whose edit is still being sent. A poll that lands meanwhile must
+  /// not put the old text back over the edit.
+  final Set<String> _editsInFlight = {};
+
   ChatHistoryNotifier(this.channelId, this.ref) {
     _loadInitial();
   }
@@ -97,6 +101,10 @@ class ChatHistoryNotifier extends ChangeNotifier {
       page = 1;
       loadFailed = false;
       _markSeen(loaded);
+      _lastPolledIds = {
+        for (final m in loaded)
+          if (m['id'] != null) m['id'].toString(),
+      };
     } catch (_) {
       loadFailed = true;
     } finally {
@@ -119,6 +127,10 @@ class ChatHistoryNotifier extends ChangeNotifier {
   /// Set of message IDs we have already seen. Used to detect truly-new messages
   /// so we don't re-fire a notification on every poll cycle.
   final Set<String> _seenIds = {};
+
+  /// The message ids the last poll (or the first load) listed. A message that
+  /// was listed then and is missing now was deleted by someone else.
+  Set<String> _lastPolledIds = {};
 
   /// Keep track of the polling timer so we can cancel it on dispose.
   // ignore: cancel_subscriptions
@@ -148,6 +160,11 @@ class ChatHistoryNotifier extends ChangeNotifier {
       final repository = ref.read(dmRepositoryProvider);
       final fresh = await repository.getMessages(channelId, page: 1);
 
+      // A message edited elsewhere keeps its id, so it is not "new": replace
+      // its text in place, without a notification or a second copy.
+      final changed =
+          _removeDeletedElsewhere(fresh) | _applyEditedContent(fresh);
+
       bool hadNew = false;
       for (final msg in fresh) {
         final id = msg['id']?.toString();
@@ -168,7 +185,14 @@ class ChatHistoryNotifier extends ChangeNotifier {
 
       if (hadNew) {
         // Prepend only the genuinely new messages at the top.
-        final existingIds = messages.map((m) => m['id']?.toString()).toSet();
+        // A message just sent keeps its local id and stores the server's id as
+        // thread_id, so match on both or the poll adds a second copy of it.
+        final existingIds = <String?>{
+          for (final m in messages) ...[
+            m['id']?.toString(),
+            if (m['thread_id'] != null) m['thread_id'].toString(),
+          ],
+        };
         final newOnly = fresh
             .where(
               (m) =>
@@ -180,11 +204,93 @@ class ChatHistoryNotifier extends ChangeNotifier {
         if (newOnly.isNotEmpty) {
           messages = [...newOnly, ...messages];
           notifyListeners();
+          return;
         }
       }
+      if (changed) notifyListeners();
     } catch (_) {
       // Silent — polling failures should not surface to the UI.
     }
+  }
+
+  /// Drops the loaded messages that someone else deleted, and returns whether
+  /// any were. The poll only sees the newest page, and a deleted message is
+  /// simply missing from it, so a message counts as deleted only when it is
+  /// inside that newest window, the last poll listed it, and this one does
+  /// not. An empty answer proves nothing and removes nothing, and neither does
+  /// a message still sending, failed, or being edited here.
+  bool _removeDeletedElsewhere(List<Map<String, dynamic>> fresh) {
+    final freshIds = {
+      for (final m in fresh)
+        if (m['id'] != null) m['id'].toString(),
+    };
+    final previousIds = _lastPolledIds;
+    if (fresh.isEmpty) return false;
+    _lastPolledIds = freshIds;
+
+    // Where the newest page ends in the list: older messages are not judged.
+    final windowEnd = messages.indexWhere(
+      (m) => m['id']?.toString() == fresh.last['id']?.toString(),
+    );
+    if (windowEnd < 0) return false;
+
+    final kept = <Map<String, dynamic>>[];
+    for (var i = 0; i < messages.length; i++) {
+      final m = messages[i];
+      final id = m['id']?.toString();
+      final deleted =
+          i <= windowEnd &&
+          id != null &&
+          previousIds.contains(id) &&
+          !freshIds.contains(id) &&
+          m['status'] == null &&
+          !_editsInFlight.contains(id) &&
+          editingMessageId != id;
+      if (!deleted) kept.add(m);
+    }
+    if (kept.length == messages.length) return false;
+    messages = kept;
+    return true;
+  }
+
+  /// Puts the server's text and attachments on every loaded message that was
+  /// changed elsewhere since it was loaded. Skips messages being edited here
+  /// and messages still sending or failed, which the server has not seen, and
+  /// returns whether anything changed.
+  bool _applyEditedContent(List<Map<String, dynamic>> fresh) {
+    final latest = <String, Map<String, dynamic>>{
+      for (final m in fresh)
+        if (m['id'] != null && !_isDeleted(m)) m['id'].toString(): m,
+    };
+    var changed = false;
+    messages = messages.map((m) {
+      final id = m['id']?.toString();
+      if (id == null || !latest.containsKey(id)) return m;
+      if (_editsInFlight.contains(id) || editingMessageId == id) return m;
+      if (m['status'] != null) return m;
+      final server = latest[id]!;
+      final content = server['content'];
+      final media = server['media'];
+      final contentChanged = content != null && content != m['content'];
+      // A message edited elsewhere can come back with other attachments, so
+      // the file name and link shown must follow the server's.
+      final mediaChanged = media is List && !_sameMedia(media, m['media']);
+      if (!contentChanged && !mediaChanged) return m;
+      changed = true;
+      final updated = Map<String, dynamic>.from(m);
+      if (contentChanged) updated['content'] = content;
+      if (mediaChanged) updated['media'] = media;
+      return updated;
+    }).toList();
+    return changed;
+  }
+
+  bool _sameMedia(List<dynamic> server, Object? local) {
+    if (local is! List || local.length != server.length) return false;
+    for (var i = 0; i < server.length; i++) {
+      if (server[i].toString() != local[i].toString()) return false;
+    }
+    return true;
   }
 
   @override
@@ -213,10 +319,28 @@ class ChatHistoryNotifier extends ChangeNotifier {
         page: nextPage,
       );
 
-      messages = [
-        ...messages,
-        ...newMessages.where((m) => !_isDeleted(m) && !_isCleared(m)),
-      ];
+      // A message that arrived since the list was loaded pushes everything
+      // down, so the next page can start with a message already shown. Only
+      // the ones not shown yet are added.
+      final shownIds = <String>{
+        for (final m in messages) ...[
+          if (m['id'] != null) m['id'].toString(),
+          if (m['thread_id'] != null) m['thread_id'].toString(),
+        ],
+      };
+      final older = newMessages
+          .where(
+            (m) =>
+                !_isDeleted(m) &&
+                !_isCleared(m) &&
+                !shownIds.contains(m['id']?.toString()),
+          )
+          .toList();
+      for (final m in older) {
+        final id = m['id']?.toString();
+        if (id != null) _seenIds.add(id);
+      }
+      messages = [...messages, ...older];
       // Pages run newest first, so once a cleared message shows up every
       // older page is cleared too.
       hasMore =
@@ -247,7 +371,11 @@ class ChatHistoryNotifier extends ChangeNotifier {
   }
 
   // What each message was sent with, so a retry sends it the same way.
-  final Map<String, ({List<XFile>? media, bool isChannel})> _sendOptions = {};
+  final Map<
+    String,
+    ({List<XFile>? media, List<dynamic>? mentions, bool isChannel})
+  >
+  _sendOptions = {};
 
   /// Makes each optimistic message id unique, even for sends in the same
   /// millisecond: the id keys [_sendOptions] and the message's later update.
@@ -291,7 +419,11 @@ class ChatHistoryNotifier extends ChangeNotifier {
         ],
     };
 
-    _sendOptions[tempId] = (media: media, isChannel: isChannel);
+    _sendOptions[tempId] = (
+      media: media,
+      mentions: mentions,
+      isChannel: isChannel,
+    );
     messages = [optimisticMessage, ...messages];
     notifyListeners();
 
@@ -349,6 +481,7 @@ class ChatHistoryNotifier extends ChangeNotifier {
         channelId,
         content,
         media: options?.media,
+        mentions: options?.mentions,
         isChannel:
             failedMsg['is_channel'] as bool? ?? options?.isChannel ?? false,
       );
@@ -462,17 +595,19 @@ class ChatHistoryNotifier extends ChangeNotifier {
     }
   }
 
-  Future<void> saveEdit(String messageId, String newContent) {
+  /// Saves an edit. Completes with false when the request failed, in which
+  /// case the message already shows its previous text again.
+  Future<bool> saveEdit(String messageId, String newContent) {
     final previous = _saveEditChains[messageId] ?? Future<void>.value();
     final task = previous.then((_) => _runSaveEdit(messageId, newContent));
-    _saveEditChains[messageId] = task.catchError((_) {});
+    _saveEditChains[messageId] = task.then<void>((_) {}).catchError((_) {});
     return task;
   }
 
-  Future<void> _runSaveEdit(String messageId, String newContent) async {
+  Future<bool> _runSaveEdit(String messageId, String newContent) async {
     if (newContent.trim().isEmpty) {
       cancelEditing();
-      return;
+      return true;
     }
 
     final original = messages.firstWhere(
@@ -496,6 +631,7 @@ class ChatHistoryNotifier extends ChangeNotifier {
     }
     notifyListeners();
 
+    _editsInFlight.add(messageId);
     try {
       final repository = ref.read(dmRepositoryProvider);
       await repository.editMessage(
@@ -503,6 +639,7 @@ class ChatHistoryNotifier extends ChangeNotifier {
         content: newContent,
         threadId: threadId,
       );
+      return true;
     } catch (_) {
       messages = messages.map((m) {
         if (m['id'] == messageId && m['content'] == newContent) {
@@ -513,11 +650,14 @@ class ChatHistoryNotifier extends ChangeNotifier {
         return m;
       }).toList();
       notifyListeners();
+      return false;
+    } finally {
+      _editsInFlight.remove(messageId);
     }
   }
 }
 
-final chatHistoryProvider =
-    ChangeNotifierProvider.autoDispose.family<ChatHistoryNotifier, String>(
+final chatHistoryProvider = ChangeNotifierProvider.autoDispose
+    .family<ChatHistoryNotifier, String>(
       (ref, channelId) => ChatHistoryNotifier(channelId, ref),
     );
